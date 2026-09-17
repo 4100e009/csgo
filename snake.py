@@ -2,19 +2,60 @@ import os
 import random
 import time
 import msvcrt
+import json
 from collections import deque
 
 WIDTH = 30
 HEIGHT = 15
 SPEED = 0.08
+MEMORY_FILE = "snake_memory.json"
+ALPHA = 0.20
+GAMMA = 0.90
+EPSILON_START = 0.25
+EPSILON_MIN = 0.03
+EPSILON_DECAY = 0.995
 
 snake = [(WIDTH // 2, HEIGHT // 2)]
 direction = (1, 0)
 score = 0
 food = None
 ai_mode = False
+episode = 0
+best_score = 0
+best_length = 1
+q_table = {}
+epsilon = EPSILON_START
 
 DIRECTIONS = [(1, 0), (-1, 0), (0, -1), (0, 1)]
+
+
+def load_memory():
+    global q_table, epsilon, episode, best_score, best_length
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        q_table = data.get("q_table", {})
+        epsilon = data.get("epsilon", EPSILON_START)
+        episode = data.get("episodes", 0)
+        best_score = data.get("best_score", 0)
+        best_length = data.get("best_length", 1)
+    except (OSError, ValueError, json.JSONDecodeError):
+        q_table = {}
+
+
+def save_memory():
+    data = {
+        "q_table": q_table,
+        "epsilon": epsilon,
+        "episodes": episode,
+        "best_score": best_score,
+        "best_length": best_length,
+    }
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError:
+        pass
 
 
 def new_food():
@@ -33,9 +74,13 @@ def reset():
 
 def draw():
     os.system("cls")
-    mode = "進階 AI 自動模式" if ai_mode else "玩家模式"
+    mode = "學習型 AI" if ai_mode else "玩家模式"
     print("🐍 貪食蛇 Snake - " + mode)
-    print("分數:", score)
+    print("分數:", score, "| 長度:", len(snake))
+    print("AI 局數:", episode, "| 歷史最高:", best_score,
+          "| 記憶狀態:", len(q_table), "個狀態")
+    if ai_mode:
+        print("探索率:", round(epsilon, 3))
     print("+" + "-" * WIDTH + "+")
 
     body = set(snake[1:])
@@ -55,7 +100,7 @@ def draw():
 
     print("+" + "-" * WIDTH + "+")
     if ai_mode:
-        print("AI：路徑搜尋 + 安全性評估，按 A 切換、Q 離開")
+        print("AI：BFS 路徑 + 安全評估 + Q-learning，A 切換、Q 離開")
     else:
         print("WASD 移動，A 開啟 AI，Q 離開")
 
@@ -68,12 +113,8 @@ def set_direction(new_direction):
 
 
 def change_direction(key):
-    directions = {
-        b"w": (0, -1),
-        b"s": (0, 1),
-        b"a": (-1, 0),
-        b"d": (1, 0),
-    }
+    directions = {b"w": (0, -1), b"s": (0, 1),
+                  b"a": (-1, 0), b"d": (1, 0)}
     if key in directions:
         set_direction(directions[key])
 
@@ -92,29 +133,22 @@ def neighbors(pos):
 
 
 def simulate_move(s, d):
-    """模擬一步移動，回傳新蛇身；若撞牆/身體則回傳 None。"""
     head = s[0]
     new_head = (head[0] + d[0], head[1] + d[1])
     if not inside(new_head):
         return None
-
-    # 沒吃到食物時，尾巴會移走，因此允許進入原本的尾巴位置。
-    occupied = set(s[:-1])
-    if new_head in occupied:
+    if new_head in set(s[:-1]):
         return None
-
     if new_head == food:
         return [new_head] + s
     return [new_head] + s[:-1]
 
 
 def bfs_path(s, target):
-    """BFS 找到目前蛇身狀態下到 target 的最短安全路徑。"""
     start = s[0]
     blocked = set(s[:-1])
     queue = deque([start])
     previous = {start: None}
-
     while queue:
         cur = queue.popleft()
         if cur == target:
@@ -124,23 +158,18 @@ def bfs_path(s, target):
                 cur = previous[cur]
             path.reverse()
             return path
-
         for nxt in neighbors(cur):
-            if nxt in blocked or nxt in previous:
-                continue
-            previous[nxt] = cur
-            queue.append(nxt)
-
+            if nxt not in blocked and nxt not in previous:
+                previous[nxt] = cur
+                queue.append(nxt)
     return None
 
 
 def reachable_area(s):
-    """計算蛇頭目前能活動的空間，越大越不容易把自己困死。"""
     start = s[0]
     blocked = set(s[:-1])
     queue = deque([start])
     seen = {start}
-
     while queue:
         cur = queue.popleft()
         for nxt in neighbors(cur):
@@ -151,14 +180,12 @@ def reachable_area(s):
 
 
 def can_reach_tail(s):
-    """檢查走這一步後，蛇頭是否仍有機會追到尾巴。"""
     if len(s) <= 2:
         return True
     target = s[-1]
     blocked = set(s[:-1])
     queue = deque([s[0]])
     seen = {s[0]}
-
     while queue:
         cur = queue.popleft()
         if cur == target:
@@ -172,83 +199,118 @@ def can_reach_tail(s):
     return False
 
 
-def direction_from(head, next_pos):
-    return (next_pos[0] - head[0], next_pos[1] - head[1])
+def relative_action(action):
+    """0=直走、1=左轉、2=右轉。"""
+    dx, dy = direction
+    if action == 0:
+        return direction
+    if action == 1:
+        return (dy, -dx)
+    return (-dy, dx)
+
+
+def danger_for(s, d):
+    return int(simulate_move(s, d) is None)
+
+
+def state_key():
+    """把盤面壓縮成 Q-learning 可學習的狀態。"""
+    head = snake[0]
+    left = relative_action(1)
+    right = relative_action(2)
+    straight = direction
+    danger = (danger_for(snake, straight),
+              danger_for(snake, left),
+              danger_for(snake, right))
+
+    fx = 0 if food is None else (food[0] > head[0]) - (food[0] < head[0])
+    fy = 0 if food is None else (food[1] > head[1]) - (food[1] < head[1])
+
+    area = reachable_area(snake)
+    area_level = 0 if area < 20 else 1 if area < 60 else 2 if area < 150 else 3
+    length_level = 0 if len(snake) < 5 else 1 if len(snake) < 10 else 2 if len(snake) < 20 else 3
+
+    return str((danger, fx, fy, area_level, length_level))
+
+
+def q_values(state):
+    if state not in q_table:
+        q_table[state] = [0.0, 0.0, 0.0]
+    return q_table[state]
+
+
+def choose_action(state):
+    values = q_values(state)
+    if random.random() < epsilon:
+        return random.randrange(3)
+    best = max(values)
+    choices = [i for i, v in enumerate(values) if v == best]
+    return random.choice(choices)
+
+
+def learn(state, action, reward, next_state, done=False):
+    current = q_values(state)
+    if done:
+        target = reward
+    else:
+        target = reward + GAMMA * max(q_values(next_state))
+    current[action] += ALPHA * (target - current[action])
+
+
+def path_score(d, simulated):
+    area = reachable_area(simulated)
+    tail_safe = can_reach_tail(simulated)
+    path = bfs_path(simulated, food) if food is not None else None
+    value = area * 12 + (700 if tail_safe else -1400)
+    if path:
+        value += 500 - len(path) * 6
+    if simulated[0] == food:
+        value += 5000
+    return value
 
 
 def ai_move():
-    """進階 AI：BFS 尋路 + 吃食物後的安全檢查 + 空間評估。"""
     global direction
-
-    head = snake[0]
+    state = state_key()
     legal = []
 
-    for d in DIRECTIONS:
-        if d == (-direction[0], -direction[1]):
-            continue
+    for action in range(3):
+        d = relative_action(action)
         simulated = simulate_move(snake, d)
         if simulated is not None:
-            legal.append((d, simulated))
+            learned = q_values(state)[action] * 80
+            planning = path_score(d, simulated)
+            legal.append((planning + learned, action, d))
 
     if not legal:
-        return
+        return state, 0
 
-    best = None
+    best_value = max(x[0] for x in legal)
+    best_actions = [x for x in legal if x[0] == best_value]
+    _, chosen, d = random.choice(best_actions)
 
-    for d, simulated in legal:
-        # 先評估這一步之後能不能活著追到尾巴。
-        tail_safe = can_reach_tail(simulated)
-        area = reachable_area(simulated)
+    # 少量探索，讓 AI 能發現比目前策略更好的走法。
+    if random.random() < epsilon:
+        _, chosen, d = random.choice(legal)
 
-        # 尋找通往食物的路徑。
-        path = bfs_path(simulated, food) if food is not None else None
-
-        # 若能吃到食物，模擬整條路徑，確認最後不會立刻把自己困死。
-        food_safe = False
-        path_len = 9999
-        if path:
-            path_len = len(path)
-            test = simulated
-            valid = True
-            for next_pos in path:
-                d2 = direction_from(test[0], next_pos)
-                test = simulate_move(test, d2)
-                if test is None:
-                    valid = False
-                    break
-            if valid:
-                food_safe = can_reach_tail(test) and reachable_area(test) >= max(3, len(test) // 3)
-
-        # 評分：安全性優先，其次追食物，最後偏好較大的活動空間。
-        score_value = 0
-        score_value += area * 12
-        score_value += 500 if tail_safe else -1000
-        if food_safe:
-            score_value += 3000
-            score_value -= path_len * 15
-        elif path:
-            score_value += 300
-            score_value -= path_len * 5
-        if simulated[0] == food:
-            score_value += 5000
-
-        # 避免太靠近死角；可達空間越大越優先。
-        candidate = (score_value, d, simulated)
-        if best is None or candidate[0] > best[0]:
-            best = candidate
-
-    set_direction(best[1])
+    set_direction(d)
+    return state, chosen
 
 
-def game_over():
-    draw()
-    print("\n遊戲結束！")
-    print("最終分數:", score)
-    print("按任意鍵結束...")
-    msvcrt.getch()
+def end_episode(reward):
+    global episode, best_score, best_length, epsilon
+    episode += 1
+    best_score = max(best_score, score)
+    best_length = max(best_length, len(snake))
+    epsilon = max(EPSILON_MIN, epsilon * EPSILON_DECAY)
+    save_memory()
 
 
+load_memory()
 reset()
+
+last_state = None
+last_action = None
 
 while True:
     draw()
@@ -258,33 +320,60 @@ while True:
         if msvcrt.kbhit():
             key = msvcrt.getch().lower()
             if key == b"q":
+                save_memory()
                 raise SystemExit
             if key == b"a":
                 ai_mode = not ai_mode
+                if ai_mode:
+                    reset()
                 break
             if not ai_mode:
                 change_direction(key)
 
     if ai_mode:
-        ai_move()
+        last_state, last_action = ai_move()
 
     head = snake[0]
     new_head = (head[0] + direction[0], head[1] + direction[1])
+    collision = not inside(new_head) or new_head in snake[:-1]
 
-    if not inside(new_head) or new_head in snake[:-1]:
-        game_over()
+    if collision:
+        if ai_mode and last_state is not None:
+            learn(last_state, last_action, -100, last_state, True)
+            end_episode(-100)
+            time.sleep(0.25)
+            reset()
+            continue
+        draw()
+        print("\n遊戲結束！")
+        print("最終分數:", score)
+        print("按任意鍵結束...")
+        msvcrt.getch()
         break
 
+    old_distance = abs(head[0] - food[0]) + abs(head[1] - food[1]) if food else 0
     snake.insert(0, new_head)
+    ate = new_head == food
 
-    if new_head == food:
+    if ate:
         score += 1
+        reward = 15
         food = new_food()
-        if food is None:
-            draw()
-            print("\n🎉 AI 成功填滿整個地圖！")
-            print("最終分數:", score)
-            msvcrt.getch()
-            break
     else:
         snake.pop()
+        new_distance = abs(new_head[0] - food[0]) + abs(new_head[1] - food[1]) if food else old_distance
+        reward = 0.15 if new_distance < old_distance else -0.05
+
+    if ai_mode and last_state is not None:
+        next_state = state_key()
+        learn(last_state, last_action, reward, next_state)
+
+    if food is None:
+        if ai_mode:
+            end_episode(100)
+            reset()
+            continue
+        draw()
+        print("\n🎉 成功填滿整個地圖！")
+        msvcrt.getch()
+        break
